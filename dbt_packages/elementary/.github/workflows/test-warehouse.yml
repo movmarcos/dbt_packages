@@ -1,0 +1,274 @@
+name: Test warehouse platform
+on:
+  workflow_dispatch:
+    inputs:
+      warehouse-type:
+        type: choice
+        required: true
+        description: Type of warehouse platform
+        options:
+          - postgres
+          - snowflake
+          - bigquery
+          - redshift
+          - databricks_catalog
+          - spark
+          - athena
+          - trino
+          - clickhouse
+          - dremio
+          - duckdb
+          - sqlserver
+          - fabric
+          - vertica
+      elementary-ref:
+        type: string
+        required: false
+        description: Branch or tag to checkout for 'elementary' repository
+      dbt-data-reliability-ref:
+        type: string
+        required: false
+        description: Branch or tag to checkout for 'dbt-data-reliability' repository
+      dbt-version:
+        type: string
+        required: false
+        default: "latest_official"
+        description: dbt's version to test with
+
+  workflow_call:
+    inputs:
+      warehouse-type:
+        type: string
+        required: true
+      elementary-ref:
+        type: string
+        required: false
+      dbt-data-reliability-ref:
+        type: string
+        required: false
+      dbt-version:
+        type: string
+        default: "latest_official"
+        required: false
+
+env:
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  TESTS_DIR: ${{ github.workspace }}/dbt-data-reliability/integration_tests
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      # Serialises runs for the same warehouse × dbt-version × branch.
+      # The schema name is derived from a hash of this group (see "Write dbt profiles").
+      group: tests_${{ inputs.warehouse-type }}_dbt_${{ inputs.dbt-version }}_${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Elementary
+        uses: actions/checkout@v6
+        with:
+          repository: elementary-data/elementary
+          path: elementary
+          ref: ${{ inputs.elementary-ref }}
+
+      - name: Checkout dbt package
+        uses: actions/checkout@v6
+        with:
+          path: dbt-data-reliability
+          ref: ${{ inputs.dbt-data-reliability-ref }}
+
+      - name: Start Postgres
+        if: inputs.warehouse-type == 'postgres'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: docker compose up -d postgres
+
+      - name: Start Trino
+        if: inputs.warehouse-type == 'trino'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: docker compose -f docker-compose-trino.yml up -d
+
+      - name: Start Clickhouse
+        if: inputs.warehouse-type == 'clickhouse'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: docker compose up -d clickhouse
+
+      - name: Start Dremio
+        if: inputs.warehouse-type == 'dremio'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: |
+          docker compose -f docker-compose-dremio.yml up -d
+          # Wait for Dremio to be healthy (one-shot containers like
+          # minio-setup exit immediately, so --wait would fail).
+          echo "Waiting for Dremio to become healthy..."
+          timeout 180 bash -c 'until [ "$(docker inspect -f {{.State.Health.Status}} dremio 2>/dev/null)" = "healthy" ]; do sleep 5; done'
+          echo "Dremio is healthy."
+
+      - name: Start SQL Server
+        if: inputs.warehouse-type == 'sqlserver'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: |
+          docker compose -f docker-compose-sqlserver.yml up -d
+          echo "Waiting for SQL Server to become healthy..."
+          timeout 120 bash -c 'until [ "$(docker inspect -f {{.State.Health.Status}} sqlserver 2>/dev/null)" = "healthy" ]; do sleep 5; done'
+          echo "SQL Server is healthy."
+
+      - name: Install ODBC Driver
+        if: inputs.warehouse-type == 'sqlserver' || inputs.warehouse-type == 'fabric'
+        run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      - name: Start Spark
+        if: inputs.warehouse-type == 'spark'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: |
+          docker compose -f docker-compose-spark.yml build
+          docker compose -f docker-compose-spark.yml up -d
+          echo "Waiting for MinIO setup to complete..."
+          timeout 60 bash -c '
+            until [ "$(docker inspect -f "{{.State.Status}}" spark-minio-setup 2>/dev/null)" = "exited" ]; do sleep 2; done
+            EXIT_CODE=$(docker inspect -f "{{.State.ExitCode}}" spark-minio-setup 2>/dev/null)
+            if [ "$EXIT_CODE" != "0" ]; then echo "MinIO setup failed with exit code $EXIT_CODE"; exit 1; fi
+          '
+          echo "MinIO is ready."
+          echo "Waiting for Spark Thrift Server to become healthy..."
+          timeout 180 bash -c 'until [ "$(docker inspect -f {{.State.Health.Status}} spark-thrift 2>/dev/null)" = "healthy" ]; do sleep 5; done'
+          echo "Spark Thrift Server is healthy."
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Spark requirements
+        if: inputs.warehouse-type == 'spark'
+        run: sudo apt-get update && sudo apt-get install -y python3-dev libsasl2-dev gcc
+
+      - name: Install compatible databricks connector (not limited in older dbt-databricks versions)
+        if: startsWith(inputs.warehouse-type, 'databricks') && inputs.dbt-version < '1.7.0'
+        run: pip install databricks-sql-connector==2.9.3
+
+      - name: Reject unsupported Vertica + Fusion combination
+        if: inputs.warehouse-type == 'vertica' && inputs.dbt-version == 'fusion'
+        run: |
+          echo "::error::dbt Fusion does not support third-party adapters such as dbt-vertica."
+          exit 1
+
+      - name: Install dbt-vertica
+        if: inputs.warehouse-type == 'vertica' && inputs.dbt-version != 'fusion'
+        run: |
+          # dbt-vertica pins dbt-core~=1.8 which lacks native support for the
+          # "arguments" test property used by the integration-test framework.
+          # Install dbt-vertica without deps, then install the requested
+          # dbt-core version separately (dbt-vertica works fine with newer
+          # dbt-core versions).
+          pip install dbt-vertica --no-deps
+          pip install vertica-python \
+            "dbt-core${{ (!startsWith(inputs.dbt-version, 'latest') && format('=={0}', inputs.dbt-version)) || '' }}"
+
+      - name: Install dbt
+        if: ${{ inputs.dbt-version != 'fusion' && inputs.warehouse-type != 'vertica' }}
+        run:
+          pip install${{ (inputs.dbt-version == 'latest_pre' && ' --pre') || '' }}
+          "dbt-core${{ (!startsWith(inputs.dbt-version, 'latest') && format('=={0}', inputs.dbt-version)) || '' }}"
+          "dbt-${{ (inputs.warehouse-type == 'databricks_catalog' && 'databricks') || (inputs.warehouse-type == 'spark' && 'spark[PyHive]') || (inputs.warehouse-type == 'athena' && 'athena-community') || inputs.warehouse-type }}${{ (!startsWith(inputs.dbt-version, 'latest') && format('~={0}', inputs.dbt-version)) || '' }}"
+
+      - name: Install dbt-fusion
+        if: inputs.dbt-version == 'fusion'
+        run: |
+          curl -fsSL https://public.cdn.getdbt.com/fs/install/install.sh | sh -s --
+
+      - name: Install Elementary
+        run: |
+          # For Vertica, dbt-vertica is already installed with --no-deps above;
+          # using ".[vertica]" would re-resolve dbt-vertica's deps and downgrade
+          # dbt-core to ~=1.8.  Install elementary without the adapter extra.
+          if [ "${{ inputs.warehouse-type }}" = "vertica" ]; then
+            pip install "./elementary"
+          else
+            pip install "./elementary[${{ (inputs.warehouse-type == 'databricks_catalog' && 'databricks') || inputs.warehouse-type }}]"
+          fi
+
+      - name: Write dbt profiles
+        env:
+          CI_WAREHOUSE_SECRETS: ${{ secrets.CI_WAREHOUSE_SECRETS || '' }}
+        run: |
+          # Schema name = dbt_<YYMMDD_HHMMSS>_<branch≤18>_<8-char hash>
+          # The hash prevents collisions across concurrent jobs; the branch
+          # keeps it human-readable; the timestamp helps with stale schema
+          # cleanup and ensures each CI run gets a unique schema.
+          #
+          # Budget (PostgreSQL 63-char limit):
+          #   dbt_(4) + timestamp(13) + _(1) + branch(≤18) + _(1) + hash(8) = 45
+          #   + _elementary(11) + _gw7(4) = 60
+          CONCURRENCY_GROUP="tests_${{ inputs.warehouse-type }}_dbt_${{ inputs.dbt-version }}_${BRANCH_NAME}"
+          SHORT_HASH=$(echo -n "$CONCURRENCY_GROUP" | sha256sum | head -c 8)
+          SAFE_BRANCH=$(echo "${BRANCH_NAME}" | awk '{print tolower($0)}' | sed "s/[^a-z0-9]/_/g; s/__*/_/g" | head -c 18)
+          DATE_STAMP=$(date -u +%y%m%d_%H%M%S)
+          SCHEMA_NAME="dbt_${DATE_STAMP}_${SAFE_BRANCH}_${SHORT_HASH}"
+
+          echo "Schema name: $SCHEMA_NAME (branch='${BRANCH_NAME}', timestamp=${DATE_STAMP}, hash of concurrency group)"
+
+          python "${{ github.workspace }}/dbt-data-reliability/integration_tests/profiles/generate_profiles.py" \
+            --template "${{ github.workspace }}/dbt-data-reliability/integration_tests/profiles/profiles.yml.j2" \
+            --output ~/.dbt/profiles.yml \
+            --schema-name "$SCHEMA_NAME"
+
+      - name: Install dependencies
+        working-directory: ${{ env.TESTS_DIR }}
+        run: |
+          ${{ (inputs.dbt-version == 'fusion' && '~/.local/bin/dbt') || 'dbt' }} deps --project-dir dbt_project
+          ln -sfn ${{ github.workspace }}/dbt-data-reliability dbt_project/dbt_packages/elementary
+          pip install -r requirements.txt
+
+      - name: Start Vertica
+        if: inputs.warehouse-type == 'vertica'
+        working-directory: ${{ env.TESTS_DIR }}
+        run: docker compose -f docker-compose-vertica.yml up -d
+
+      - name: Wait for Vertica to be ready
+        if: inputs.warehouse-type == 'vertica'
+        run: |
+          echo "Waiting for Vertica to be healthy..."
+          timeout 60 bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" vertica)" == "healthy" ]; do echo "Waiting..."; sleep 5; done'
+          echo "Vertica is ready!"
+
+      - name: Check DWH connection
+        working-directory: ${{ env.TESTS_DIR }}
+        run: |
+          ${{ (inputs.dbt-version == 'fusion' && '~/.local/bin/dbt') || 'dbt' }} debug -t "${{ inputs.warehouse-type }}"
+
+      - name: Test
+        working-directory: "${{ env.TESTS_DIR }}/tests"
+        run: py.test -n${{ (inputs.warehouse-type == 'spark' && '4') || '8' }} -vvv --target "${{ inputs.warehouse-type }}" --junit-xml=test-results.xml --html=detailed_report_${{ inputs.warehouse-type }}_dbt_${{ inputs.dbt-version }}.html --self-contained-html --clear-on-end ${{ (inputs.dbt-version == 'fusion' && '--runner-method fusion') || '' }}
+
+      - name: Upload test results
+        if: always()
+        uses: pmeier/pytest-results-action@v0.8.0
+        with:
+          path: ${{ env.TESTS_DIR }}/tests/test-results.xml
+          summary: true
+          display-options: fEX
+          fail-on-empty: true
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: detailed_report_${{ inputs.warehouse-type }}_dbt_${{ inputs.dbt-version }}
+          path: ${{ env.TESTS_DIR }}/tests/detailed_report_${{ inputs.warehouse-type }}_dbt_${{ inputs.dbt-version }}.html
+
+      - name: Drop test schemas
+        if: >-
+          always() &&
+          contains(fromJSON('["snowflake","bigquery","redshift","databricks_catalog","athena","fabric"]'), inputs.warehouse-type)
+        working-directory: ${{ env.TESTS_DIR }}
+        continue-on-error: true
+        run: |
+          ${{ (inputs.dbt-version == 'fusion' && '~/.local/bin/dbt') || 'dbt' }} run-operation elementary_tests.drop_test_schemas \
+            --project-dir dbt_project \
+            -t "${{ inputs.warehouse-type }}"
