@@ -8,7 +8,7 @@
 #   [STEP 3/4] Install Python dependencies    (requirements.txt)
 #   [STEP 4/4] Loop -Projects, call deploy.py once per project:
 #                   * PHASE 1 -- upload project files to Snowflake stage
-#                   * PHASE 2 -- register the DBT PROJECT object
+#                   * PHASE 2 -- register the DBT PROJECT (CREATE OR REPLACE)
 #                   * PHASE 3 -- EXECUTE DBT PROJECT ... ARGS='<dbt_args>'
 #
 #  Project resolution:

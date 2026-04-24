@@ -10,8 +10,8 @@ What this script does, per invocation (single project):
              • ALTER STAGE ... REFRESH so DBT PROJECT sees the new directory
 
     PHASE 2  Register the DBT PROJECT object
-             • CREATE DBT PROJECT IF NOT EXISTS <name> FROM '@stage'
-             • ALTER DBT PROJECT <name> REFRESH  (picks up the uploaded code)
+             • CREATE OR REPLACE DBT PROJECT <name> FROM '@stage'
+               (single call handles both first-time create and updates)
 
     PHASE 3  Execute dbt inside Snowflake
              • EXECUTE DBT PROJECT <name> ARGS='<dbt_args>'  (default: 'build')
@@ -218,23 +218,15 @@ def upload_project_to_stage(session, stage_fqn, project_dir: Path):
 # ─── Register & execute the dbt project ──────────────────────────────────────
 
 def register_dbt_project(session, project_fqn, stage_fqn):
-    """Create (or refresh) the DBT PROJECT object pointing at the stage."""
+    """Create/replace the DBT PROJECT object pointing at the stage."""
     print(f"\n  📚 Registering DBT PROJECT {project_fqn}...")
-    create_sql = f"CREATE DBT PROJECT IF NOT EXISTS {project_fqn} FROM '@{stage_fqn}'"
+    create_sql = f"CREATE OR REPLACE DBT PROJECT {project_fqn} FROM '@{stage_fqn}'"
     try:
         session.sql(create_sql).collect()
-    except Exception as e:
-        print(f"     ❌ CREATE failed. SQL:\n        {create_sql}")
-        print(f"     ❌ Error:\n{e}")
-        return False
-
-    refresh_sql = f"ALTER DBT PROJECT {project_fqn} REFRESH"
-    try:
-        session.sql(refresh_sql).collect()
-        print(f"     ✅ Project registered & refreshed")
+        print(f"     ✅ Project registered")
         return True
     except Exception as e:
-        print(f"     ❌ REFRESH failed. SQL:\n        {refresh_sql}")
+        print(f"     ❌ CREATE OR REPLACE failed. SQL:\n        {create_sql}")
         print(f"     ❌ Error:\n{e}")
         return False
 
