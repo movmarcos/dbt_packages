@@ -40,8 +40,12 @@ import os
 import sys
 import time
 import argparse
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+# Number of parallel upload streams per PUT call.
+UPLOAD_PARALLEL = 8
 
 # ─── Fixed configuration ─────────────────────────────────────────────────────
 DBT_SCHEMA     = 'DBT'                  # schema holding the stage + DBT PROJECT object
@@ -171,26 +175,59 @@ def upload_project_to_stage(session, stage_fqn, project_dir: Path):
         print(f"     ⚠️  Stage cleanup warning: {e}")
 
     # ── Upload ───────────────────────────────────────────────────────────
-    print(f"\n  📤 Uploading {len(files)} files...")
-    errors = 0
+    # Group files by their subdirectory so each subdir becomes a single PUT
+    # call (one glob per subdir, with `parallel` streams inside each call).
+    # If a subdir contains any file we intentionally excluded (e.g. deploy.py
+    # at the root), fall back to per-file PUTs for that subdir only.
+    by_subdir: "dict[str, list[Path]]" = defaultdict(list)
     for local_path, rel in files:
-        subdir = os.path.dirname(rel)
-        stage_path = f'@{stage_fqn}/{subdir}' if subdir else f'@{stage_fqn}'
+        by_subdir[os.path.dirname(rel)].append(local_path)
+
+    print(f"\n  📤 Uploading {len(files)} files across {len(by_subdir)} directories "
+          f"(parallel={UPLOAD_PARALLEL})...")
+    errors = 0
+
+    for subdir in sorted(by_subdir):
+        subdir_files = by_subdir[subdir]
+        local_dir    = (project_dir / subdir) if subdir else project_dir
+        stage_path   = f'@{stage_fqn}/{subdir}' if subdir else f'@{stage_fqn}'
+
         try:
-            session.file.put(
-                str(local_path).replace('\\', '/'),
-                stage_path,
-                auto_compress=False,
-                overwrite=True,
-            )
-            print(f"     ✅ {rel}")
-        except Exception as e:
-            print(f"     ❌ {rel}: {e}")
-            errors += 1
+            actual_names = {p.name for p in local_dir.iterdir() if p.is_file()}
+        except OSError:
+            actual_names = set()
+        included_names = {p.name for p in subdir_files}
+
+        if actual_names and actual_names == included_names:
+            # All files in this subdir are included → glob PUT
+            glob_pattern = str(local_dir / '*').replace('\\', '/')
+            try:
+                session.file.put(
+                    glob_pattern, stage_path,
+                    auto_compress=False, overwrite=True,
+                    parallel=UPLOAD_PARALLEL,
+                )
+            except Exception as e:
+                print(f"     ❌ {subdir or '(root)'}/*: {str(e).splitlines()[0][:160]}")
+                errors += len(subdir_files)
+        else:
+            # Some files excluded → upload each one explicitly
+            for local_path in subdir_files:
+                try:
+                    session.file.put(
+                        str(local_path).replace('\\', '/'), stage_path,
+                        auto_compress=False, overwrite=True,
+                        parallel=UPLOAD_PARALLEL,
+                    )
+                except Exception as e:
+                    print(f"     ❌ {subdir}/{local_path.name}: "
+                          f"{str(e).splitlines()[0][:160]}")
+                    errors += 1
 
     if errors:
-        print(f"  ⚠️ {errors} files failed to upload")
+        print(f"  ⚠️ {errors} file(s) failed to upload")
         return False
+    print(f"     ✅ Uploaded {len(files)} files across {len(by_subdir)} directories")
 
     # Refresh directory so DBT PROJECT sees new files
     try:
