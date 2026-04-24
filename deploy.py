@@ -1,64 +1,103 @@
 """
-deploy.py — Deploy this dbt project to Snowflake (dbt Projects on Snowflake)
+deploy.py — Deploy a dbt project to Snowflake (dbt Projects on Snowflake)
 ================================================================================
-Usage:
-    python deploy.py --target test --project-name dbt_package --project-dir ./dbt_package
-    python deploy.py --target test --suffix 25_04 --project-name dbt_package --project-dir ./dbt_package
-    python deploy.py --target prod --project-name dbt_package --project-dir ./dbt_package \\
+What this script does, per invocation (single project):
+
+    PHASE 1  Upload project files → internal Snowflake stage
+             • CREATE SCHEMA / CREATE STAGE if missing
+             • REMOVE files that exist on-stage but not locally (stale cleanup)
+             • PUT every local file (incl. dbt_packages/) to the stage
+             • ALTER STAGE ... REFRESH so DBT PROJECT sees the new directory
+
+    PHASE 2  Register the DBT PROJECT object
+             • CREATE DBT PROJECT IF NOT EXISTS <name> FROM '@stage'
+             • ALTER DBT PROJECT <name> REFRESH  (picks up the uploaded code)
+
+    PHASE 3  Execute dbt inside Snowflake
+             • EXECUTE DBT PROJECT <name> ARGS='<dbt_args>'  (default: 'build')
+
+Connection context (role / warehouse / database) is derived from --target and
+--db-type using the pattern documented on `build_target_cfg`.
+
+Usage examples:
+    python deploy.py --target dvlp --suffix 25_04 \\
+                     --project-name dbt_package --project-dir ./dbt_package
+    python deploy.py --target prod \\
+                     --project-name dbt_package --project-dir ./dbt_package \\
                      --dbt-args "run --select tag:daily"
 
 Prerequisites:
     pip install mufg_snowflakeconn snowflake-snowpark-python
 
 Design notes:
-    - No `dbt deps` runs inside Snowflake (no external network). `dbt_packages/`
-      is committed to the repo and uploaded to the stage alongside the rest of
-      the project.
-    - One database per environment (dev / test / release / prod). --target
-      selects the connection context.
-    - Shared across multiple dbt projects — the PowerShell wrapper loops and
-      invokes this script once per project, passing --project-name/--project-dir.
+    - No `dbt deps` runs inside Snowflake (no external network access from the
+      compute). `dbt_packages/` is committed to the repo and uploaded to the
+      stage alongside the rest of the project.
+    - Shared across multiple dbt projects — the PowerShell wrapper
+      (`deploy_all.ps1`) loops and invokes this script once per project.
 """
 import os
 import sys
+import time
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 # ─── Fixed configuration ─────────────────────────────────────────────────────
-DBT_SCHEMA = 'DBT'   # schema holding the stage + DBT PROJECT object
-
-# Map --target → connection context. Each target's `database` is the base
-# name; an optional --suffix is appended as `<database>_<suffix>` when given.
-TARGETS = {
-    'dev': {
-        'env':       'dvlp',
-        'role':      'DVLP_RAPTOR_OWNER',
-        'warehouse': 'DVLP_RAVEN_WH_M',
-        'database':  'DVLP_RAPTOR_ANALYTICS',
-    },
-    'test': {
-        'env':       'dvlp',
-        'role':      'DVLP_RAPTOR_OWNER',
-        'warehouse': 'DVLP_RAVEN_WH_M',
-        'database':  'DVLP_RAPTOR_ANALYTICS_TEST',
-    },
-    'release': {
-        'env':       'uat',
-        'role':      'UAT_RAPTOR_OWNER',
-        'warehouse': 'UAT_RAVEN_WH_M',
-        'database':  'UAT_RAPTOR_ANALYTICS',
-    },
-    'prod': {
-        'env':       'prod',
-        'role':      'PROD_RAPTOR_OWNER',
-        'warehouse': 'PROD_RAVEN_WH_M',
-        'database':  'PROD_RAPTOR_ANALYTICS',
-    },
-}
+DBT_SCHEMA     = 'DBT'                  # schema holding the stage + DBT PROJECT object
+DEFAULT_DBTYPE = 'RAPTOR'               # override via --db-type
+VALID_TARGETS  = ['dvlp', 'test', 'rlse', 'prod']
 
 # Files/dirs NOT uploaded to the stage (local-only artefacts)
-UPLOAD_EXCLUDE_DIRS  = {'.git', '.venv', 'venv', 'target', 'logs', '__pycache__', '.vscode', '.idea'}
+UPLOAD_EXCLUDE_DIRS  = {'.git', '.venv', 'venv', 'target', 'logs',
+                       '__pycache__', '.vscode', '.idea'}
 UPLOAD_EXCLUDE_NAMES = {'deploy.py', '.DS_Store', '.gitignore'}
+
+
+def build_target_cfg(target: str, db_type: str, suffix: str) -> dict:
+    """
+    Build the Snowflake connection context from --target, --db-type, --suffix.
+
+    Pattern:
+        env       = target                           e.g. 'dvlp'
+        role      = <TARGET>_<DBTYPE>_OWNER          e.g. 'DVLP_RAPTOR_OWNER'
+        warehouse = <TARGET>_<DBTYPE>_WH_M           e.g. 'DVLP_RAPTOR_WH_M'
+        database  = <TARGET>_<DBTYPE>[_<SUFFIX>]     e.g. 'DVLP_RAPTOR_25_04'
+
+    Suffix is appended for every target except prod.
+    """
+    t = target.upper()
+    d = db_type.upper()
+    cfg = {
+        'env':       target,
+        'role':      f'{t}_{d}_OWNER',
+        'warehouse': f'{t}_{d}_WH_M',
+        'database':  f'{t}_{d}',
+    }
+    if target != 'prod' and suffix:
+        cfg['database'] = f"{cfg['database']}_{suffix}"
+    return cfg
+
+
+# ─── Pretty-print helpers ────────────────────────────────────────────────────
+
+def _ts() -> str:
+    """Timestamp prefix for phase banners."""
+    return datetime.now().strftime('%H:%M:%S')
+
+
+def _banner(text: str, char: str = '=', width: int = 72) -> None:
+    print(char * width)
+    print(f"  {text}")
+    print(char * width)
+
+
+def _phase(step: int, total: int, title: str) -> None:
+    """Print a phase header like '[PHASE 1/3] 10:15:23 — Upload ...'."""
+    print()
+    print("─" * 72)
+    print(f"  [PHASE {step}/{total}] {_ts()}  —  {title}")
+    print("─" * 72)
 
 
 # ─── Connection ──────────────────────────────────────────────────────────────
@@ -206,17 +245,19 @@ def main():
     parser = argparse.ArgumentParser(
         description='Deploy dbt project to Snowflake (dbt Projects on Snowflake)'
     )
-    parser.add_argument('--target', required=True, choices=list(TARGETS.keys()),
-                        help='Environment: dev / test / release / prod')
+    parser.add_argument('--target', required=True, choices=VALID_TARGETS,
+                        help='Environment: dvlp / test / rlse / prod')
     parser.add_argument('--project-name', required=True,
                         help='dbt project identifier. Drives the Snowflake DBT PROJECT '
                              'object name and the stage name.')
     parser.add_argument('--project-dir', required=True,
                         help='Path to the dbt project folder (contains dbt_project.yml).')
+    parser.add_argument('--db-type', default=DEFAULT_DBTYPE,
+                        help=f"DB type component used in role/warehouse/database names "
+                             f"(default: {DEFAULT_DBTYPE} → <ENV>_{DEFAULT_DBTYPE}_OWNER etc.)")
     parser.add_argument('--suffix',
-                        help="Optional suffix appended to the target database "
-                             "(e.g. --suffix 25_04 → <DB>_25_04). Omit for the "
-                             "base database name with no trailing underscore.")
+                        help="Suffix appended to the database as <DB>_<suffix>. "
+                             "Required for every target except prod.")
     parser.add_argument('--dbt-args', default='build',
                         help="Args passed to dbt (default: 'build'). "
                              "Examples: 'run --select tag:daily', 'test', 'seed'")
@@ -234,27 +275,44 @@ def main():
     project_name_sf = args.project_name.strip().upper().replace('-', '_')
     stage_name      = f"{project_name_sf}_STAGE"
 
-    target_cfg = dict(TARGETS[args.target])
     suffix = (args.suffix or '').strip().strip('_')
-    if suffix:
-        target_cfg['database'] = f"{target_cfg['database']}_{suffix}"
+    if args.target != 'prod' and not suffix:
+        print(f"  ❌ --suffix is required for target '{args.target}' (only 'prod' may omit it)")
+        sys.exit(2)
 
+    target_cfg  = build_target_cfg(args.target, args.db_type, suffix)
     stage_fqn   = f"{target_cfg['database']}.{DBT_SCHEMA}.{stage_name}"
     project_fqn = f"{target_cfg['database']}.{DBT_SCHEMA}.{project_name_sf}"
 
-    print("=" * 64)
-    print(f"  dbt Project Deployment — {project_name_sf}")
-    print(f"  Source:   {project_dir}")
-    print(f"  Target:   {args.target}")
+    # Work out which phases will actually run so PHASE headers are numbered
+    # correctly (e.g. "[PHASE 1/2]" when --upload-only skips execution).
+    phases = []
+    if not args.execute_only:
+        phases += ['upload', 'register']
+    if not args.upload_only:
+        phases += ['execute']
+    total_phases = len(phases)
+    phase_idx    = {name: i + 1 for i, name in enumerate(phases)}
+
+    # ── Header banner ────────────────────────────────────────────────────
+    _banner(f"dbt Project Deployment — {project_name_sf}")
+    print(f"  Started    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Source     : {project_dir}")
+    print(f"  Target     : {args.target}   (db-type: {args.db_type.upper()})")
     if suffix:
-        print(f"  Suffix:   {suffix}")
-    print(f"  Database: {target_cfg['database']}")
-    print(f"  Stage:    {stage_fqn}")
-    print(f"  Project:  {project_fqn}")
-    print("=" * 64)
+        print(f"  Suffix     : {suffix}")
+    print(f"  Role       : {target_cfg['role']}")
+    print(f"  Warehouse  : {target_cfg['warehouse']}")
+    print(f"  Database   : {target_cfg['database']}")
+    print(f"  Stage      : {stage_fqn}")
+    print(f"  DBT PROJECT: {project_fqn}")
+    print(f"  dbt args   : {args.dbt_args}")
+    print("=" * 72)
+
+    t0 = time.monotonic()
 
     # ── Connect ──────────────────────────────────────────────────────────
-    print("\n  🔌 Connecting to Snowflake...")
+    print(f"\n  🔌 [{_ts()}] Connecting to Snowflake...")
     try:
         session = get_session(target_cfg)
         ctx = session.sql(
@@ -267,36 +325,31 @@ def main():
 
     success = True
 
-    # ── Upload + register ────────────────────────────────────────────────
+    # ── PHASE: Upload + register ─────────────────────────────────────────
     if not args.execute_only:
-        print("\n" + "─" * 64)
-        print("  PHASE 1: Upload project files to stage")
-        print("─" * 64)
+        _phase(phase_idx['upload'], total_phases, "Upload project files to Snowflake stage")
         if not upload_project_to_stage(session, stage_fqn, project_dir):
             success = False
 
         if success:
-            print("\n" + "─" * 64)
-            print("  PHASE 2: Register DBT PROJECT")
-            print("─" * 64)
+            _phase(phase_idx['register'], total_phases, "Register DBT PROJECT object")
             if not register_dbt_project(session, project_fqn, stage_fqn):
                 success = False
 
-    # ── Execute ──────────────────────────────────────────────────────────
+    # ── PHASE: Execute ───────────────────────────────────────────────────
     if not args.upload_only and success:
-        print("\n" + "─" * 64)
-        print(f"  PHASE 3: Execute dbt — args: {args.dbt_args}")
-        print("─" * 64)
+        _phase(phase_idx['execute'], total_phases, f"Execute dbt — 'dbt {args.dbt_args}'")
         if not execute_dbt_project(session, project_fqn, args.dbt_args):
             success = False
 
     # ── Summary ──────────────────────────────────────────────────────────
-    print("\n" + "=" * 64)
-    if success:
-        print("  ✅ DEPLOYMENT COMPLETE")
-    else:
-        print("  ⚠️  DEPLOYMENT COMPLETE WITH ERRORS — Review above.")
-    print("=" * 64)
+    elapsed = time.monotonic() - t0
+    mm, ss  = divmod(int(elapsed), 60)
+    print()
+    _banner(
+        f"{'✅ DEPLOYMENT COMPLETE' if success else '⚠️  DEPLOYMENT COMPLETE WITH ERRORS'}"
+        f"  —  elapsed {mm:02d}:{ss:02d}"
+    )
 
     session.close()
     return 0 if success else 1
