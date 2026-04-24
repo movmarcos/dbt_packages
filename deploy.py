@@ -150,29 +150,14 @@ def upload_project_to_stage(session, stage_fqn, project_dir: Path):
         return False
 
     files = list(iter_project_files(project_dir))
-    expected = {rel.lower() for _, rel in files}
 
-    # ── Remove stale files (files deleted locally) ───────────────────────
-    print(f"\n  🧹 Checking for stale files on stage...")
+    # ── Wipe the stage clean before re-uploading ─────────────────────────
+    print(f"\n  🧹 Clearing stage {stage_fqn}...")
     try:
-        staged = session.sql(f"LIST @{stage_fqn}").collect()
-        removed = 0
-        for row in staged:
-            raw = row['name']
-            slash_idx = raw.find('/')
-            rel_path = raw[slash_idx + 1:] if slash_idx != -1 else raw
-            rel_cmp = rel_path[:-3].lower() if rel_path.lower().endswith('.gz') else rel_path.lower()
-            if rel_cmp not in expected:
-                try:
-                    session.sql(f"REMOVE @{stage_fqn}/{rel_path}").collect()
-                    print(f"     🗑️  Removed stale: {rel_path}")
-                    removed += 1
-                except Exception as rm_err:
-                    print(f"     ⚠️  Could not remove {rel_path}: {rm_err}")
-        if removed == 0:
-            print(f"     ✅ No stale files found")
+        session.sql(f"REMOVE @{stage_fqn}").collect()
+        print(f"     ✅ Stage cleared")
     except Exception as e:
-        print(f"     ⚠️  Stage cleanup warning: {e}")
+        print(f"     ⚠️  Stage cleanup warning: {str(e).splitlines()[0][:160]}")
 
     # ── Upload ───────────────────────────────────────────────────────────
     # Group files by their subdirectory so each subdir becomes a single PUT
