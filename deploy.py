@@ -2,10 +2,10 @@
 deploy.py — Deploy this dbt project to Snowflake (dbt Projects on Snowflake)
 ================================================================================
 Usage:
-    python deploy.py --target test                         # upload + register + `dbt build`
-    python deploy.py --target prod --dbt-args "run --select tag:daily"
-    python deploy.py --target dev --upload-only            # upload + refresh only
-    python deploy.py --target test --execute-only          # skip upload; just execute
+    python deploy.py --target test --project-name dbt_package --project-dir ./dbt_package
+    python deploy.py --target test --suffix 25_04 --project-name dbt_package --project-dir ./dbt_package
+    python deploy.py --target prod --project-name dbt_package --project-dir ./dbt_package \\
+                     --dbt-args "run --select tag:daily"
 
 Prerequisites:
     pip install mufg_snowflakeconn snowflake-snowpark-python
@@ -16,22 +16,19 @@ Design notes:
       the project.
     - One database per environment (dev / test / release / prod). --target
       selects the connection context.
-    - Each dbt project in the repo gets its own copy of this script (or its
-      own constants block) — the two projects deploy independently.
+    - Shared across multiple dbt projects — the PowerShell wrapper loops and
+      invokes this script once per project, passing --project-name/--project-dir.
 """
 import os
 import sys
 import argparse
 from pathlib import Path
 
-# ─── Per-project configuration ───────────────────────────────────────────────
-# Edit this block when copying the script to the second dbt project.
-PROJECT_DIR      = Path(__file__).parent
-DBT_PROJECT_NAME = 'DBT_PACKAGE'           # Snowflake DBT PROJECT object name
-DBT_SCHEMA       = 'DBT'                   # schema holding stage + project object
-DBT_STAGE_NAME   = 'DBT_PACKAGE_STAGE'     # stage under that schema
+# ─── Fixed configuration ─────────────────────────────────────────────────────
+DBT_SCHEMA = 'DBT'   # schema holding the stage + DBT PROJECT object
 
-# Map --target → connection context. Adjust role/warehouse/database per env.
+# Map --target → connection context. Each target's `database` is the base
+# name; an optional --suffix is appended as `<database>_<suffix>` when given.
 TARGETS = {
     'dev': {
         'env':       'dvlp',
@@ -92,7 +89,7 @@ def iter_project_files(project_dir: Path):
         yield path, path.relative_to(project_dir).as_posix()
 
 
-def upload_project_to_stage(session, stage_fqn):
+def upload_project_to_stage(session, stage_fqn, project_dir: Path):
     """Create the stage if needed, remove stale files, PUT every project file."""
     print(f"\n  📦 Ensuring stage {stage_fqn}...")
     try:
@@ -109,7 +106,7 @@ def upload_project_to_stage(session, stage_fqn):
         print(f"     ❌ Stage creation failed: {e}")
         return False
 
-    files = list(iter_project_files(PROJECT_DIR))
+    files = list(iter_project_files(project_dir))
     expected = {rel.lower() for _, rel in files}
 
     # ── Remove stale files (files deleted locally) ───────────────────────
@@ -211,6 +208,15 @@ def main():
     )
     parser.add_argument('--target', required=True, choices=list(TARGETS.keys()),
                         help='Environment: dev / test / release / prod')
+    parser.add_argument('--project-name', required=True,
+                        help='dbt project identifier. Drives the Snowflake DBT PROJECT '
+                             'object name and the stage name.')
+    parser.add_argument('--project-dir', required=True,
+                        help='Path to the dbt project folder (contains dbt_project.yml).')
+    parser.add_argument('--suffix',
+                        help="Optional suffix appended to the target database "
+                             "(e.g. --suffix 25_04 → <DB>_25_04). Omit for the "
+                             "base database name with no trailing underscore.")
     parser.add_argument('--dbt-args', default='build',
                         help="Args passed to dbt (default: 'build'). "
                              "Examples: 'run --select tag:daily', 'test', 'seed'")
@@ -220,13 +226,28 @@ def main():
                         help='Skip upload; just execute')
     args = parser.parse_args()
 
-    target_cfg  = TARGETS[args.target]
-    stage_fqn   = f"{target_cfg['database']}.{DBT_SCHEMA}.{DBT_STAGE_NAME}"
-    project_fqn = f"{target_cfg['database']}.{DBT_SCHEMA}.{DBT_PROJECT_NAME}"
+    project_dir = Path(args.project_dir).resolve()
+    if not (project_dir / 'dbt_project.yml').is_file():
+        print(f"  ❌ No dbt_project.yml in {project_dir}")
+        sys.exit(2)
+
+    project_name_sf = args.project_name.strip().upper().replace('-', '_')
+    stage_name      = f"{project_name_sf}_STAGE"
+
+    target_cfg = dict(TARGETS[args.target])
+    suffix = (args.suffix or '').strip().strip('_')
+    if suffix:
+        target_cfg['database'] = f"{target_cfg['database']}_{suffix}"
+
+    stage_fqn   = f"{target_cfg['database']}.{DBT_SCHEMA}.{stage_name}"
+    project_fqn = f"{target_cfg['database']}.{DBT_SCHEMA}.{project_name_sf}"
 
     print("=" * 64)
-    print(f"  dbt Project Deployment — {DBT_PROJECT_NAME}")
+    print(f"  dbt Project Deployment — {project_name_sf}")
+    print(f"  Source:   {project_dir}")
     print(f"  Target:   {args.target}")
+    if suffix:
+        print(f"  Suffix:   {suffix}")
     print(f"  Database: {target_cfg['database']}")
     print(f"  Stage:    {stage_fqn}")
     print(f"  Project:  {project_fqn}")
@@ -251,7 +272,7 @@ def main():
         print("\n" + "─" * 64)
         print("  PHASE 1: Upload project files to stage")
         print("─" * 64)
-        if not upload_project_to_stage(session, stage_fqn):
+        if not upload_project_to_stage(session, stage_fqn, project_dir):
             success = False
 
         if success:

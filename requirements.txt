@@ -1,0 +1,2 @@
+mufg_snowflakeconn
+snowflake-snowpark-python
