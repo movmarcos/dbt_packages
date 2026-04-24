@@ -220,20 +220,23 @@ def upload_project_to_stage(session, stage_fqn, project_dir: Path):
 def register_dbt_project(session, project_fqn, stage_fqn):
     """Create (or refresh) the DBT PROJECT object pointing at the stage."""
     print(f"\n  📚 Registering DBT PROJECT {project_fqn}...")
+    create_sql = f"CREATE DBT PROJECT IF NOT EXISTS {project_fqn} FROM '@{stage_fqn}'"
     try:
-        session.sql(
-            f"CREATE DBT PROJECT IF NOT EXISTS {project_fqn} FROM '@{stage_fqn}'"
-        ).collect()
+        session.sql(create_sql).collect()
     except Exception as e:
-        print(f"     ❌ Register failed: {e}")
+        print(f"     ❌ CREATE failed. SQL:\n        {create_sql}")
+        print(f"     ❌ Error:\n{e}")
         return False
 
+    refresh_sql = f"ALTER DBT PROJECT {project_fqn} REFRESH"
     try:
-        session.sql(f"ALTER DBT PROJECT {project_fqn} REFRESH").collect()
+        session.sql(refresh_sql).collect()
         print(f"     ✅ Project registered & refreshed")
+        return True
     except Exception as e:
-        print(f"     ⚠️  Refresh note: {str(e).split(chr(10))[0][:150]}")
-    return True
+        print(f"     ❌ REFRESH failed. SQL:\n        {refresh_sql}")
+        print(f"     ❌ Error:\n{e}")
+        return False
 
 
 def execute_dbt_project(session, project_fqn, dbt_args):
