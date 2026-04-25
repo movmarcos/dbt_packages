@@ -532,11 +532,14 @@ function Connect-AzWithCertificate {
         Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null
     }
 
-    # Pre-flight: surface auth failures here, before AzCopy spawns and emits "Unknown".
+    # Pre-flight: confirm Connect-AzAccount actually produced a usable context.
+    # We deliberately do NOT call Get-AzAccessToken here - the storage token is fetched
+    # by AzCopy itself via PSCRED, which is the whole point of this auth flow.
     $ctx = Get-AzContext
-    if (-not $ctx) { throw "Get-AzContext returned null after Connect-AzAccount." }
-    $null = Get-AzAccessToken -ResourceUrl "https://storage.azure.com/"
-    Write-Host "Pre-flight token OK for $($ctx.Account.Id)" -ForegroundColor Green
+    if (-not $ctx -or -not $ctx.Account) {
+        throw "Get-AzContext returned no account after Connect-AzAccount."
+    }
+    Write-Host "Az context OK: Account=$($ctx.Account.Id) Tenant=$($ctx.Tenant.Id) Subscription=$($ctx.Subscription.Id)" -ForegroundColor Green
 
     return $cert
 }
@@ -584,7 +587,9 @@ function RunAzCopy {
     Write-Host "Running: $AzCopyExe $($azcommand -join ' ')"
     $azcopy = & $AzCopyExe @azcommand
     $logfileMatch = [regex]::match($azcopy, 'Log file is located at: (.+\.log)')
-    $azlogfile = if ($logfileMatch) {$logfileMatch.Groups[1].Value} else {"Cannot match log file location: $logfileMatch"}
+    if ($logfileMatch.Success) {
+        Write-Host "AzCopy log: $($logfileMatch.Groups[1].Value)"
+    }
     
     # $azerror = CheckAzCopyLogForErrors -azlogfile:$azlogfile
     
